@@ -23,12 +23,14 @@
 #include <llvm/Transforms/Utils.h>
 
 #include <llvm/IR/Function.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/Pass.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 
+#include <queue>
 
 using namespace llvm;
 static ManagedStatic<LLVMContext> GlobalContext;
@@ -50,7 +52,20 @@ struct EnableFunctionOptPass: public FunctionPass {
 
 char EnableFunctionOptPass::ID=0;
 
-	
+// Returns true if a new use is inserted
+template <typename KT, typename VT>
+bool insertUseToMap(std::map<KT, std::set<VT>> &map, KT key, VT value) {
+  auto it = map.find(key);
+  if (it == map.end()) {
+    std::set<VT> s = {value};
+    map.insert(std::make_pair(key, s));
+  }
+  else {
+    return it->second.insert(value).second;
+  }
+  return true;
+}
+
 ///!TODO TO BE COMPLETED BY YOU FOR ASSIGNMENT 2
 ///Updated 11/10/2017 by fargo: make all functions
 ///processed by mem2reg before this pass.
@@ -60,11 +75,125 @@ struct FuncPtrPass : public ModulePass {
 
   
   bool runOnModule(Module &M) override {
-    errs() << "Hello: ";
-    errs().write_escaped(M.getName()) << '\n';
-    M.dump();
-    errs()<<"------------------------------\n";
+    for (Function &F : M) {
+      if (!F.getName().startswith("llvm.dbg")) {
+        for (BasicBlock &BB : F) {
+          for (BasicBlock::iterator i = BB.begin(); i != BB.end(); ++i) {
+            processInstruction(dyn_cast<Instruction>(i));
+          }
+        }
+      }
+    }
+
+    propagateFunctionUse();
+
+    for (auto callee : mCalleeList) {
+      errs() << callee.first << " : ";
+      if (isa<Function>(callee.second)) {
+        errs() << callee.second->getName();
+      }
+      else {
+        auto it = mFuncMap.find(callee.second);
+        if (it != mFuncMap.end()) {
+          bool first = true;
+          for (Value *v : it->second) {
+            if (first) {
+              first = false;
+            }
+            else {
+              errs() << ", ";
+            }
+            errs() << v->getName();
+          }
+        }
+        else {
+          errs() << "NULL";
+        }
+      }
+      errs() << '\n';
+    }
+
     return false;
+  }
+
+private:
+  std::vector<std::pair<unsigned int, Value*>> mCalleeList; // (line number, callee)
+  std::map<Value*, std::set<Value*>> mValueMap; // variable -> {user variables}
+  std::map<Value*, std::set<Value*>> mFuncMap; // variable -> {possible functions}
+
+  void processInstruction(Instruction *inst) {
+    if (PHINode *phi = dyn_cast<PHINode>(inst)) {
+      if (phi->getType()->isPointerTy()) {
+        for (Value *in : phi->incoming_values()) {
+          insertUseToMap(mValueMap, in, cast<Value>(inst));
+        }
+      }
+    }
+
+    else if (CallInst *call = dyn_cast<CallInst>(inst)) {
+      Value *callee = call->getCalledOperand();
+      if (!callee->getName().startswith("llvm.dbg")) {
+        mCalleeList.push_back(std::make_pair(inst->getDebugLoc().getLine(), callee));
+        for (unsigned int i = 0; i < call->getNumArgOperands(); i++) {
+          Value *arg = call->getArgOperand(i);
+          if (arg->getType()->isPointerTy()) {
+            Function *f = dyn_cast<Function>(callee);
+            // TODO: f is null (multiple possible callee functions)
+            insertUseToMap(mValueMap, arg, cast<Value>(f->getArg(i)));
+          }
+        }
+      }
+    }
+
+    else if (ReturnInst *ret = dyn_cast<ReturnInst>(inst)) {
+      if (ret->getType()->isPointerTy()) {
+        Function *f = ret->getFunction();
+        // TODO: indirect calls to this function
+        for (Value *user : f->users()) {
+          insertUseToMap(mValueMap, ret->getReturnValue(), user);
+        }
+      }
+    }
+  }
+
+  void propagateFunctionUse() {
+    std::queue<Value*> pending;
+
+    // add direct function uses to mFuncMap
+    for (auto it : mValueMap) {
+      if (isa<Function>(it.first)) {
+        for (Value *var : it.second) {
+          insertUseToMap(mFuncMap, var, it.first);
+        }
+      }
+    }
+
+    // start from initial uses in mFuncMap
+    for (auto it : mFuncMap) {
+      pending.push(it.first);
+    }
+
+    // propagate until all values have been processed
+    while (!pending.empty()) {
+      Value *var = pending.front();
+      pending.pop();
+      auto vit = mValueMap.find(var);
+      if (vit != mValueMap.end()) {
+        for (Value *newvar : vit->second) {
+          bool inserted = false;
+          auto fit = mFuncMap.find(var);
+          if (fit != mFuncMap.end()) {
+            for (Value *v : fit->second) {
+              inserted |= insertUseToMap(mFuncMap, newvar, v);
+            }
+          }
+          // if a value is updated, repropagate it
+          if (inserted) {
+            pending.push(newvar);
+          }
+        }
+      }
+    }
   }
 };
 
