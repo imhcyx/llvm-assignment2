@@ -172,9 +172,11 @@ private:
   }
 
   void processFunction(Function &F, CallInst *parentCall, MapType &parentMap) {
+    if (F.isDeclaration()) return;
+  
     std::vector<BasicBlock*> stackBB = {&F.getEntryBlock()};
-    std::vector<BasicBlock*> stackPredBB = {nullptr};
     std::vector<MapType> stackMap = {{}};
+    std::vector<std::vector<BasicBlock*>> stackPath = {{}};
 
     // handle arguments
     if (parentCall) {
@@ -189,16 +191,21 @@ private:
     // FIXME: currently unable to handle loop
     while (!stackBB.empty()) {
       BasicBlock *bb = stackBB.back();
-      BasicBlock *pred = stackPredBB.back();
       MapType map = stackMap.back();
+      std::vector<BasicBlock*> path = stackPath.back();
       stackBB.pop_back();
-      stackPredBB.pop_back();
       stackMap.pop_back();
+      stackPath.pop_back();
+
+      if (std::find(path.begin(), path.end(), bb) != path.end()) {
+        // workaround for loop
+        continue;
+      }
 
       for (Instruction &I : *bb) {
         if (PHINode *phi = dyn_cast<PHINode>(&I)) {
           if (phi->getType()->isPointerTy()) {
-            copyUse(map, phi, map, phi->getIncomingValueForBlock(pred));
+            copyUse(map, phi, map, phi->getIncomingValueForBlock(path.back()));
           }
         }
 
@@ -229,12 +236,27 @@ private:
             }
           }
         }
-      }
 
-      for (BasicBlock *suc : successors(bb)) {
-        stackBB.push_back(suc);
-        stackPredBB.push_back(bb);
-        stackMap.push_back(map);
+        // kill branch with constant condition
+        else if (BranchInst *br = dyn_cast<BranchInst>(&I)) {
+          BasicBlock* kill = nullptr;
+          if (br->isConditional()) {
+            Value *cond = br->getCondition();
+            if (ConstantInt *ci = dyn_cast<ConstantInt>(cond)) {
+              kill = br->getSuccessor(ci->isZero() ? 0 : 1);
+            }
+          }
+          for (BasicBlock *succ : br->successors()) {
+            if (succ != kill) {
+              std::vector<BasicBlock*> newpath = path;
+              newpath.push_back(bb);
+              stackBB.push_back(succ);
+              stackMap.push_back(map);
+              stackPath.push_back(newpath);
+            }
+          }
+          break;
+        }
       }
 
       mergeToGlobalMap(map);
@@ -294,6 +316,8 @@ int main(int argc, char **argv) {
 #ifdef DEBUG_PRINT
    Passes.add(new NameAnonymousValuePass());
 #endif
+
+   Passes.add(llvm::createConstantPropagationPass());
 
    /// Your pass to print Function and Call Instructions
    Passes.add(new FuncPtrPass());
