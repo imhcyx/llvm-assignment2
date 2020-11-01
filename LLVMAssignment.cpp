@@ -24,13 +24,13 @@
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/Pass.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 
-#include <queue>
 #include <sstream>
 
 //#define DEBUG_PRINT
@@ -128,174 +128,131 @@ struct FuncPtrPass : public ModulePass {
 
   
   bool runOnModule(Module &M) override {
-
-    scanModule(M);
-    propagateFunctionUses();
-  
-  #ifdef DEBUG_PRINT
-    errs() << "---------- mUseChains ----------\n";
-    dumpMap(mUseChains);
-    errs() << "---------- mFuncMap ----------\n";
-    dumpMap(mFuncMap);
-    errs() << "---------- mReturnMap ----------\n";
-    dumpMap(mReturnMap);
-    errs() << "---------- mCallMap ----------\n";
-    dumpMap(mCallMap);
-    errs() << "--------------------\n";
-  #endif
-
+    processModule(M);
+#ifdef DEBUG_PRINT
+    errs() << "---------- mUseMap ----------\n";
+    dumpMap(mUseMap);
+#endif
     dumpResult();
-
     return false;
   }
 
 private:
-  std::vector<std::pair<unsigned int, Value*>> mCalleeList; // (line number, callee)
-  std::map<Value*, std::set<Value*>> mUseChains; // variable -> {user variables}
-  std::map<Value*, std::set<Function*>> mFuncMap; // variable -> {possible functions}
-  std::map<Function*, std::set<Value*>> mReturnMap; // function -> {return values}
-  std::map<Value*, std::set<CallInst*>> mCallMap; // variable -> {calls to this pointer}
+  using MapType = std::map<Value*, std::set<Function*>>;
+  MapType mUseMap; // variable -> {possible functions}
+  std::map<unsigned int, std::set<Function*>> mCallMap; // line number -> {possible functions}
 
-  bool insertUse(Value *src, Value *dst) {
+  void copyUse(MapType &dstmap, Value *dst, MapType &srcmap, Value *src) {
     if (Function *f = dyn_cast<Function>(src)) {
-      return insertRecordToMap(mFuncMap, dst, f);
+      insertRecordToMap(dstmap, dst, f);
+      return;
     }
-    else {
-      return insertRecordToMap(mUseChains, src, dst);
-    }
-  }
-
-  void processInstruction(Instruction *inst) {
-    if (PHINode *phi = dyn_cast<PHINode>(inst)) {
-      if (phi->getType()->isPointerTy()) {
-        for (Value *in : phi->incoming_values()) {
-          insertUse(in, phi);
-        }
-      }
-    }
-
-    else if (CallInst *call = dyn_cast<CallInst>(inst)) {
-      Value *callee = call->getCalledOperand();
-      if (!callee->getName().startswith("llvm.dbg")) {
-        mCalleeList.push_back(std::make_pair(inst->getDebugLoc().getLine(), callee));
-        if (Function *f = dyn_cast<Function>(callee)) {
-          for (unsigned int i = 0; i < call->getNumArgOperands(); i++) {
-            Value *arg = call->getArgOperand(i);
-            if (arg->getType()->isPointerTy()) {
-              insertUse(arg, f->getArg(i));
-            }
-          }
-        }
-        else {
-          insertRecordToMap(mCallMap, callee, call);
-        }
-      }
-    }
-
-    else if (ReturnInst *ret = dyn_cast<ReturnInst>(inst)) {
-      Value *v = ret->getReturnValue();
-      if (v->getType()->isPointerTy()) {
-        insertRecordToMap(mReturnMap, ret->getFunction(), v);
+    auto it = srcmap.find(src);
+    if (it != srcmap.end()) {
+      for (Function *f : it->second) {
+        insertRecordToMap(dstmap, dst, f);
       }
     }
   }
 
-  void scanModule(Module &M) {
+  void mergeToGlobalMap(MapType &map) {
+    for (auto it : map) {
+      for (Function *f : it.second) {
+        insertRecordToMap(mUseMap, it.first, f);
+      }
+    }
+  }
+
+  void processModule(Module &M) {
     for (Function &F : M) {
       if (!F.getName().startswith("llvm.dbg")) {
-        for (BasicBlock &BB : F) {
-          for (BasicBlock::iterator i = BB.begin(); i != BB.end(); ++i) {
-            processInstruction(dyn_cast<Instruction>(i));
-          }
-        }
+        processFunction(F, nullptr, mUseMap);
       }
     }
   }
 
-  void updateUseChainsForCall(std::queue<Value*> &workQ, Value *callee) {
-    auto cit = mCallMap.find(callee); // all calls to callee
-    auto fit = mFuncMap.find(callee); // possible functions which callee points to
-    if (cit != mCallMap.end() && fit != mFuncMap.end()) {
-      for (CallInst *call : cit->second) {
-        for (Function *f : fit->second) {
-          for (unsigned int i = 0; i < call->getNumArgOperands(); i++) {
-            Value *arg = call->getArgOperand(i);
-            if (arg->getType()->isPointerTy()) {
-              if (insertUse(arg, f->getArg(i))) {
-                workQ.push(arg); // repropagate if updated
-              }
-            }
+  void processFunction(Function &F, CallInst *parentCall, MapType &parentMap) {
+    std::vector<BasicBlock*> stackBB = {&F.getEntryBlock()};
+    std::vector<BasicBlock*> stackPredBB = {nullptr};
+    std::vector<MapType> stackMap = {{}};
+
+    // handle arguments
+    if (parentCall) {
+      for (unsigned int i = 0; i < parentCall->getNumArgOperands(); i++) {
+        Value *arg = parentCall->getArgOperand(i);
+        if (arg->getType()->isPointerTy()) {
+          copyUse(stackMap.back(), F.getArg(i), parentMap, arg);
+        }
+      }
+    }
+
+    // FIXME: currently unable to handle loop
+    while (!stackBB.empty()) {
+      BasicBlock *bb = stackBB.back();
+      BasicBlock *pred = stackPredBB.back();
+      MapType map = stackMap.back();
+      stackBB.pop_back();
+      stackPredBB.pop_back();
+      stackMap.pop_back();
+
+      for (Instruction &I : *bb) {
+        if (PHINode *phi = dyn_cast<PHINode>(&I)) {
+          if (phi->getType()->isPointerTy()) {
+            copyUse(map, phi, map, phi->getIncomingValueForBlock(pred));
           }
-          auto rit = mReturnMap.find(f);
-          if (rit != mReturnMap.end()) {
-            for (Value *v: rit->second) {
-              if (insertUse(v, call)) {
-                workQ.push(v); // repropagate if updated
+        }
+
+        else if (CallInst *call = dyn_cast<CallInst>(&I)) {
+          Value *callee = call->getCalledOperand();
+          if (!callee->getName().startswith("llvm.dbg")) {
+            if (Function *f = dyn_cast<Function>(callee)) {
+              insertRecordToMap(mCallMap, I.getDebugLoc().getLine(), f);
+              processFunction(*f, call, map);
+            }
+            else {
+              auto it = map.find(callee);
+              if (it != map.end()) {
+                for (Function *f : it->second) {
+                  insertRecordToMap(mCallMap, I.getDebugLoc().getLine(), f);
+                  processFunction(*f, call, map);
+                }
               }
             }
           }
         }
-      }
-    }
-  }
 
-  void propagateFunctionUses() {
-    std::queue<Value*> pending;
-
-    // start from initial uses in mFuncMap
-    for (auto it : mFuncMap) {
-      pending.push(it.first);
-    }
-
-    // propagate until all values have been processed
-    while (!pending.empty()) {
-      Value *var = pending.front();
-      pending.pop();
-      // try finding indirect calls using this variable
-      updateUseChainsForCall(pending, var);
-      // propagate from var to newvar according to mUseChains
-      auto vit = mUseChains.find(var);
-      if (vit != mUseChains.end()) {
-        for (Value *newvar : vit->second) {
-          bool inserted = false;
-          auto fit = mFuncMap.find(var); // fit->second: possible values for var
-          if (fit != mFuncMap.end()) {
-            for (Function *v : fit->second) {
-              inserted |= insertRecordToMap(mFuncMap, newvar, v);
+        else if (ReturnInst *ret = dyn_cast<ReturnInst>(&I)) {
+          if (parentCall) {
+            Value *v = ret->getReturnValue();
+            if (v->getType()->isPointerTy()) {
+              copyUse(parentMap, parentCall, map, v);
             }
-          }
-          // if a value is updated, repropagate it
-          if (inserted) {
-            pending.push(newvar);
           }
         }
       }
+
+      for (BasicBlock *suc : successors(bb)) {
+        stackBB.push_back(suc);
+        stackPredBB.push_back(bb);
+        stackMap.push_back(map);
+      }
+
+      mergeToGlobalMap(map);
     }
   }
 
   void dumpResult() {
-    for (auto callee : mCalleeList) {
-      errs() << callee.first << " : ";
-      if (isa<Function>(callee.second)) {
-        errs() << callee.second->getName();
-      }
-      else {
-        auto it = mFuncMap.find(callee.second);
-        if (it != mFuncMap.end()) {
-          bool first = true;
-          for (Function *v : it->second) {
-            if (first) {
-              first = false;
-            }
-            else {
-              errs() << ", ";
-            }
-            errs() << v->getName();
-          }
+    for (auto it : mCallMap) {
+      errs() << it.first << " : ";
+      bool first = true;
+      for (Function *f : it.second) {
+        if (first) {
+          first = false;
         }
         else {
-          errs() << "NULL";
+          errs() << ", ";
         }
+        errs() << f->getName();
       }
       errs() << '\n';
     }
